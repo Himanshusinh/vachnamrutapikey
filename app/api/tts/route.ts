@@ -75,7 +75,7 @@ export async function POST(request: NextRequest) {
     console.log('TTS: Audio data found, mimeType:', audioData.mimeType);
 
     // Convert PCM to WAV if needed
-    let finalAudio = audioData.data;
+    const finalAudio = audioData.data;
     let finalMimeType = audioData.mimeType;
 
     if (audioData.mimeType.includes('L16') || audioData.mimeType.includes('pcm')) {

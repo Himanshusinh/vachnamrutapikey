@@ -1,6 +1,47 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+
+// Type definitions for Speech Recognition API
+interface SpeechRecognitionWindow extends Window {
+  SpeechRecognition?: new () => SpeechRecognition;
+  webkitSpeechRecognition?: new () => SpeechRecognition;
+}
+
+interface SpeechRecognition extends EventTarget {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  start(): void;
+  stop(): void;
+  onresult: ((event: SpeechRecognitionEvent) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
+  onend: (() => void) | null;
+}
+
+interface SpeechRecognitionEvent {
+  results: SpeechRecognitionResultList;
+}
+
+interface SpeechRecognitionResultList {
+  [index: number]: SpeechRecognitionResult;
+  length: number;
+}
+
+interface SpeechRecognitionResult {
+  [index: number]: SpeechRecognitionAlternative;
+  length: number;
+  isFinal: boolean;
+}
+
+interface SpeechRecognitionAlternative {
+  transcript: string;
+  confidence: number;
+}
+
+interface SpeechRecognitionErrorEvent {
+  error: string;
+}
 
 export default function VachanamrutCompanion() {
   const [isListening, setIsListening] = useState(false);
@@ -11,65 +52,10 @@ export default function VachanamrutCompanion() {
   const [error, setError] = useState('');
   const [history, setHistory] = useState<Array<{ query: string; answer: string }>>([]);
   
-  const recognitionRef = useRef<any>(null);
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
 
-  useEffect(() => {
-    // Initialize Speech Recognition
-    if (typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)) {
-      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      recognitionRef.current = new SpeechRecognition();
-      recognitionRef.current.continuous = false;
-      recognitionRef.current.interimResults = false;
-      recognitionRef.current.lang = 'gu-IN'; // Gujarati + English (India)
-
-      recognitionRef.current.onresult = async (event: any) => {
-        const speechToText = event.results[0][0].transcript;
-        setTranscript(speechToText);
-        setIsListening(false);
-        
-        // Automatically process the query
-        await processQuery(speechToText);
-      };
-
-      recognitionRef.current.onerror = (event: any) => {
-        console.error('Speech recognition error:', event.error);
-        setError(`Voice recognition error: ${event.error}`);
-        setIsListening(false);
-      };
-
-      recognitionRef.current.onend = () => {
-        setIsListening(false);
-      };
-    }
-
-    return () => {
-      if (recognitionRef.current) {
-        recognitionRef.current.stop();
-      }
-    };
-  }, []);
-
-  const startListening = () => {
-    if (recognitionRef.current) {
-      setError('');
-      setTranscript('');
-      setResponse('');
-      setIsListening(true);
-      recognitionRef.current.start();
-    } else {
-      setError('Speech recognition not supported in your browser');
-    }
-  };
-
-  const stopListening = () => {
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-      setIsListening(false);
-    }
-  };
-
-  const processQuery = async (query: string) => {
+  const processQuery = useCallback(async (query: string) => {
     setIsProcessing(true);
     setError('');
 
@@ -99,6 +85,63 @@ export default function VachanamrutCompanion() {
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
       setIsProcessing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    // Initialize Speech Recognition
+    if (typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)) {
+      const SpeechRecognition = (window as SpeechRecognitionWindow).SpeechRecognition || (window as SpeechRecognitionWindow).webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        recognitionRef.current = new SpeechRecognition();
+      recognitionRef.current.continuous = false;
+      recognitionRef.current.interimResults = false;
+      recognitionRef.current.lang = 'gu-IN'; // Gujarati + English (India)
+
+      recognitionRef.current.onresult = async (event: SpeechRecognitionEvent) => {
+        const speechToText = event.results[0][0].transcript;
+        setTranscript(speechToText);
+        setIsListening(false);
+        
+        // Automatically process the query
+        await processQuery(speechToText);
+      };
+
+      recognitionRef.current.onerror = (event: SpeechRecognitionErrorEvent) => {
+        console.error('Speech recognition error:', event.error);
+        setError(`Voice recognition error: ${event.error}`);
+        setIsListening(false);
+      };
+
+      recognitionRef.current.onend = () => {
+        setIsListening(false);
+      };
+      }
+    }
+
+    return () => {
+      if (recognitionRef.current) {
+        recognitionRef.current.stop();
+      }
+    };
+  }, [processQuery]);
+
+  const startListening = () => {
+    if (recognitionRef.current) {
+      setError('');
+      setTranscript('');
+      setResponse('');
+      setIsListening(true);
+      recognitionRef.current.start();
+    } else {
+      setError('Speech recognition not supported in your browser');
+    }
+  };
+
+  const stopListening = () => {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsListening(false);
     }
   };
 
