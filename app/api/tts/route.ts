@@ -12,7 +12,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Text is required' }, { status: 400 });
     }
 
-    const apiKey = process.env.GOOGLE_AI_API_KEY || 'AIzaSyBOVBcNEavJgEygVB78WGJO1xHIDyxFh3M';
+    const apiKey = process.env.GOOGLE_AI_API_KEY || 'AIzaSyBx2856dontd1RS7yTlxNyx5DVg4an-DC0';
     
     if (!apiKey) {
       return NextResponse.json({ error: 'API key not configured' }, { status: 500 });
@@ -51,11 +51,23 @@ export async function POST(request: NextRequest) {
     );
 
     if (!response.ok) {
-      const error = await response.text();
+      let errorText = await response.text();
       console.error('TTS: API error status:', response.status);
-      console.error('TTS: API error details:', error);
+      console.error('TTS: API error details:', errorText);
+
+      // Try to parse retry delay for 429s so the client can back off
+      let retryAfterMs: number | undefined = undefined;
+      try {
+        const parsed = JSON.parse(errorText);
+        const retryInfo = parsed?.error?.details?.find((d: any) => d['@type']?.includes('RetryInfo'));
+        if (retryInfo?.retryDelay) {
+          const sec = parseInt(String(retryInfo.retryDelay).replace(/\D/g, '')) || 0;
+          retryAfterMs = sec * 1000;
+        }
+      } catch {}
+
       return NextResponse.json(
-        { error: `Failed to generate speech: ${error}` },
+        { error: 'Failed to generate speech', status: response.status, retryAfterMs },
         { status: response.status }
       );
     }

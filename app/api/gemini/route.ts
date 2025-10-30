@@ -12,7 +12,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Query is required' }, { status: 400 });
     }
 
-    const apiKey = process.env.GOOGLE_AI_API_KEY || 'AIzaSyBoWP3Wz8Y6nRdBbemTFV8shJ3DqEYpsQM';
+    const apiKey = process.env.GOOGLE_AI_API_KEY || 'AIzaSyD9U4wS-qvv7RB53MiOHw2vOAHGV4-G4kI';
     
     console.log('API Key exists:', !!apiKey);
     console.log('API Key length:', apiKey?.length);
@@ -55,10 +55,31 @@ CRITICAL INSTRUCTIONS:
 
 6. Be respectful and reverent when discussing the Vachanamrut teachings.
 
-7. Response length policy to optimize speed and clarity:
-   - Default to short or medium answers (aim 60–140 words) that are accurate and to the point.
-   - Only provide long, detailed answers if explicitly requested or clearly necessary for correctness.
-   - Prefer bullet points and short sentences when appropriate.
+7. Response quality and length policy (completeness first):
+   - Provide a complete, high-quality answer that directly addresses the question.
+   - Default to short/medium length (about 80–180 words) when sufficient.
+   - If the topic requires depth for correctness or the user implicitly asks for detail, write a longer answer. Do not omit crucial context.
+   - Prefer clear structure: start with a direct answer, then 2–5 concise bullet points elaborating, and end with a one-line takeaway.
+   - If you can cite a specific Vachanamrut (e.g., Gadhada I-10), include it; otherwise, do not fabricate citations.
+
+8. When unsure, say "I'm not completely sure from Vachanamrut alone" and ask for clarification rather than refusing. Do not hallucinate citations.
+
+EXAMPLES (follow language of the question):
+Q (English): "What is moksha as per Vachanamrut?"
+A: "Moksha in the Vachanamrut is liberation – attaining Akshardham and eternal service of Purushottam Bhagwan."
+- It is possible only through firm upasana of Parabrahman (Purushottam) with bhakti, dharma and vairagya.
+- One must associate with the Satpurush and keep niyams.
+- Even intense yogic powers are not moksha without devotion to God.
+- See e.g. Gadhada I-21, Gadhada II-13.
+Takeaway: Liberation comes by bhakti to Purushottam with dharma and satsang.
+
+Q (Gujarati): "વચનામૃત અનુસાર ભક્તિ શું છે?"
+A: "વચનામૃત મુજબ ભક્તિ એટલે પરબ્રહ્મ પુરુષોત્તમ પ્રત્યે અખંડ પ્રેમથી કરાતું ઉપાસન."
+- ધર્મ, જ્ઞાન અને વૈરાગ્ય સાથે ભક્તિ કરવી.
+- સત્પુરુષનું સત્સંગ અનિવાર્ય છે.
+- કૃષ્ણભાવના વિનાની ક્રિયા કૃત્ય પૂરતી નથી.
+- દ્રષ્ટાંત: ગઢડા પ્ર. ૧-૩૬, સુર્યપુર ૨-૧૫.
+સાર: પરબ્રહ્મ પ્રત્યેની પ્રેમભરી ભક્તિ મુક્તિનો માર્ગ છે.
 
 Question: ${query}`
                 }
@@ -66,8 +87,8 @@ Question: ${query}`
             }
           ],
           generationConfig: {
-            temperature: 0.5,
-            maxOutputTokens: 512,
+            temperature: 0.3,
+            maxOutputTokens: 1024,
             candidateCount: 1,
           }
         }),

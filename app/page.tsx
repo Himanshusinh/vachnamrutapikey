@@ -47,10 +47,13 @@ export default function VachanamrutCompanion() {
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [response, setResponse] = useState('');
+  const [displayResponse, setDisplayResponse] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [error, setError] = useState('');
   const [history, setHistory] = useState<Array<{ query: string; answer: string }>>([]);
+  type CachedTtsPart = { audio: string; mimeType: string; originalMimeType?: string };
+  type QaCacheEntry = { question: string; answer: string; ttsParts: CachedTtsPart[] };
   
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
@@ -60,12 +63,36 @@ export default function VachanamrutCompanion() {
   const ttsStartedRef = useRef<boolean>(false);
   const ttsCursorRef = useRef<number>(0); // index in `response` up to which TTS has been spoken
   const streamingDoneRef = useRef<boolean>(false);
+  const ttsCooldownUntilRef = useRef<number>(0); // epoch ms until which TTS calls should wait
+
+  // Voice capture helpers
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingTranscriptRef = useRef<string>('');
+  const hasFinalizedRef = useRef<boolean>(false);
 
   const processQuery = useCallback(async (query: string) => {
     setIsProcessing(true);
     setError('');
 
     try {
+      // 0) Try cache first
+      const cached = getFromQaCache(query);
+      if (cached) {
+        const { answer, ttsParts } = cached;
+        setHistory(prev => [...prev, { query, answer }]);
+        // Show only after complete
+        setResponse('');
+        setDisplayResponse(answer);
+        // Speak from cache if available; otherwise synthesize now and append to cache
+        if (ttsParts && ttsParts.length > 0) {
+          await speakFromCachedParts(ttsParts);
+        } else {
+          console.log('Cache hit without audio; synthesizing TTS now');
+          streamAnswerWithParallelTts(answer, query);
+        }
+        return;
+      }
+
       // Get answer from Gemini API
       const geminiResponse = await fetch('/api/gemini', {
         method: 'POST',
@@ -84,8 +111,11 @@ export default function VachanamrutCompanion() {
       // Add to history immediately (we still stream the UI)
       setHistory(prev => [...prev, { query, answer }]);
 
-      // Stream the answer in UI and start TTS after ~100 tokens
-      streamAnswerWithParallelTts(answer);
+      // Save a provisional cache entry immediately (audio parts will append)
+      trySaveToQaCache(query, answer, [], /*append*/ false);
+
+      // Stream the answer in UI and start TTS
+      streamAnswerWithParallelTts(answer, query);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
@@ -99,17 +129,27 @@ export default function VachanamrutCompanion() {
       const SpeechRecognition = (window as SpeechRecognitionWindow).SpeechRecognition || (window as SpeechRecognitionWindow).webkitSpeechRecognition;
       if (SpeechRecognition) {
         recognitionRef.current = new SpeechRecognition();
-      recognitionRef.current.continuous = false;
-      recognitionRef.current.interimResults = false;
+      recognitionRef.current.continuous = true; // allow ongoing results
+      recognitionRef.current.interimResults = true; // we want interim to track pauses
       recognitionRef.current.lang = 'gu-IN'; // Gujarati + English (India)
 
       recognitionRef.current.onresult = async (event: SpeechRecognitionEvent) => {
-        const speechToText = event.results[0][0].transcript;
-        setTranscript(speechToText);
-        setIsListening(false);
-        
-        // Automatically process the query
-        await processQuery(speechToText);
+        let finalText = '';
+        let interimText = '';
+        for (let i = 0; i < event.results.length; i++) {
+          const res = event.results[i];
+          const txt = res[0]?.transcript || '';
+          if (res.isFinal) finalText += (finalText ? ' ' : '') + txt;
+          else interimText += (interimText ? ' ' : '') + txt;
+        }
+
+        const combined = [finalText, interimText].filter(Boolean).join(' ');
+        pendingTranscriptRef.current = combined.trim();
+        setTranscript(pendingTranscriptRef.current);
+
+        // Reset the 3s silence timer on each new result
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = setTimeout(() => finalizeVoiceQuestion(), 3000);
       };
 
       recognitionRef.current.onerror = (event: SpeechRecognitionErrorEvent) => {
@@ -119,7 +159,16 @@ export default function VachanamrutCompanion() {
       };
 
       recognitionRef.current.onend = () => {
-        setIsListening(false);
+        // If recognition ends early, finalize if we have any text
+        if (!hasFinalizedRef.current) {
+          const hasText = pendingTranscriptRef.current.trim().length > 0;
+          if (hasText) {
+            // Submit immediately instead of waiting for the silence timer
+            void finalizeVoiceQuestion();
+          } else {
+            setIsListening(false);
+          }
+        }
       };
       }
     }
@@ -128,33 +177,22 @@ export default function VachanamrutCompanion() {
       if (recognitionRef.current) {
         recognitionRef.current.stop();
       }
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     };
   }, [processQuery]);
 
-  // Warm up TTS on first client render to reduce first-call latency
-  useEffect(() => {
-    if (ttsWarmedUpRef.current) return;
-    ttsWarmedUpRef.current = true;
-    // Fire-and-forget a very short TTS request; do not play the audio
-    (async () => {
-      try {
-        await fetch('/api/tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: '.' })
-        });
-      } catch (_) {
-        // Ignore warm-up errors
-      }
-    })();
-  }, []);
+  // Removed TTS warm-up to avoid consuming API quota unnecessarily
 
   const startListening = () => {
     if (recognitionRef.current) {
       setError('');
       setTranscript('');
       setResponse('');
+      setDisplayResponse('');
       setIsListening(true);
+      pendingTranscriptRef.current = '';
+      hasFinalizedRef.current = false;
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
       recognitionRef.current.start();
     } else {
       setError('Speech recognition not supported in your browser');
@@ -166,6 +204,23 @@ export default function VachanamrutCompanion() {
       recognitionRef.current.stop();
       setIsListening(false);
     }
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+  };
+
+  const finalizeVoiceQuestion = async () => {
+    if (hasFinalizedRef.current) return;
+    hasFinalizedRef.current = true;
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    const text = pendingTranscriptRef.current.trim();
+    if (recognitionRef.current) recognitionRef.current.stop();
+    setIsListening(false);
+    if (text) await processQuery(text);
   };
 
   const speakResponse = async (text: string) => {
@@ -250,9 +305,10 @@ export default function VachanamrutCompanion() {
     setIsSpeaking(false);
   };
 
-  const streamAnswerWithParallelTts = (fullAnswer: string) => {
+  const streamAnswerWithParallelTts = (fullAnswer: string, originalQuestion?: string) => {
     // Reset streaming/TTS state
     setResponse('');
+    setDisplayResponse('');
     ttsStartedRef.current = false;
     ttsCursorRef.current = 0;
     streamingDoneRef.current = false;
@@ -261,8 +317,18 @@ export default function VachanamrutCompanion() {
     // Prepare TTS parts up-front from the full answer
     const ttsParts = partitionAnswerForTts(fullAnswer);
 
-    // Kick off TTS streamer loop for these parts
-    startTtsStreamerWithParts(ttsParts);
+    // Kick off TTS streamer loop for these parts, capture audio to cache if needed
+    const ttsCapturedParts: CachedTtsPart[] = [];
+    startTtsStreamerWithParts(ttsParts, (part) => {
+      ttsCapturedParts.push(part);
+    }, () => {
+      // First audio is ready → reveal full text alongside audio
+      setDisplayResponse(fullAnswer);
+    }).finally(() => {
+      if (originalQuestion) {
+        trySaveToQaCache(originalQuestion, fullAnswer, ttsCapturedParts);
+      }
+    });
 
     // Stream words into the UI like ChatGPT
     const words = fullAnswer.split(/\s+/).filter(Boolean);
@@ -288,24 +354,29 @@ export default function VachanamrutCompanion() {
     pump();
   };
 
-  const startTtsStreamerWithParts = (parts: string[]) => {
+  const startTtsStreamerWithParts = (
+    parts: string[],
+    onPartFetched?: (part: CachedTtsPart) => void,
+    onFirstReady?: () => void
+  ): Promise<void> => {
     // Runs in background, speaking provided parts while prefetching next
-    (async () => {
+    return (async () => {
       try {
-        // Wait until allowed to start
-        while (!ttsStartedRef.current && !speakCancelRef.current) {
-          await new Promise(r => setTimeout(r, 100));
-        }
         if (speakCancelRef.current) return;
-
+        console.log('TTS streamer: starting with parts count =', parts.length);
         setIsSpeaking(true);
         // Prefetcher for provided parts
-        const prefetcher = createTtsPrefetcher(parts);
+        const prefetcher = createTtsPrefetcher(parts, onPartFetched);
         ttsCancelPrefetchRef.current = prefetcher.cancel;
 
         // Fetch first audio
         let currentBlob = await prefetcher.next();
         if (speakCancelRef.current) return;
+        if (!currentBlob) {
+          console.warn('TTS streamer: first blob missing');
+        } else {
+          try { onFirstReady && onFirstReady(); } catch {}
+        }
 
         while (currentBlob && !speakCancelRef.current) {
           const nextBlobPromise = prefetcher.next();
@@ -324,18 +395,17 @@ export default function VachanamrutCompanion() {
     const text = fullText.replace(/\s+/g, ' ').trim();
     if (!text) return [];
 
-    const lines = deriveNaturalLines(text);
-    if (lines.length <= 1) return [text];
+    // Token-like split by words; create 100-word blocks for TTS
+    const words = text.split(/\s+/).filter(Boolean);
+    const maxWordsPerPart = 100;
+    if (words.length <= maxWordsPerPart) return [text];
 
-    // Split into two halves of lines: first half, then second half
-    const mid = Math.ceil(lines.length / 2);
-    const firstHalf = lines.slice(0, mid).join(' ');
-    const secondHalf = lines.slice(mid).join(' ');
+    const parts: string[] = [];
+    for (let i = 0; i < words.length; i += maxWordsPerPart) {
+      parts.push(words.slice(i, i + maxWordsPerPart).join(' '));
+    }
 
-    // If the second half is extremely short, merge back into one part
-    if (secondHalf.length < 60) return [firstHalf + ' ' + secondHalf];
-
-    return [firstHalf, secondHalf];
+    return parts;
   };
 
   const deriveNaturalLines = (text: string): string[] => {
@@ -409,7 +479,7 @@ export default function VachanamrutCompanion() {
     return new Blob([byteArray], { type: mimeType });
   };
 
-  const createTtsPrefetcher = (chunks: string[]) => {
+  const createTtsPrefetcher = (chunks: string[], onPartFetched?: (part: CachedTtsPart) => void) => {
     let cancelled = false;
     let index = 0;
     const queue: Blob[] = [];
@@ -418,9 +488,10 @@ export default function VachanamrutCompanion() {
     const fetchSequentially = async () => {
       while (!cancelled && index < chunks.length) {
         try {
-          const blob = await fetchTtsBlob(chunks[index]);
+          const part = await fetchTtsForCaching(chunks[index]);
           if (cancelled) return;
-          queue.push(blob);
+          onPartFetched && onPartFetched({ audio: part.audioBase64, mimeType: part.mimeType, originalMimeType: part.originalMimeType });
+          queue.push(part.blob);
           index += 1;
           if (waiters.length > 0) {
             const resolve = waiters.shift();
@@ -428,13 +499,19 @@ export default function VachanamrutCompanion() {
           }
         } catch (e) {
           if (cancelled) return;
-          // On fetch error, push null to unblock waiter and stop further prefetching
-          while (waiters.length > 0) {
-            const resolve = waiters.shift();
-            resolve && resolve(null);
+          // On fetch error, push a brief silence blob and continue to next chunk
+          try {
+            const silence = createSilenceBlob(200);
+            queue.push(silence);
+            index += 1;
+            if (waiters.length > 0) {
+              const resolve = waiters.shift();
+              resolve && resolve(queue.shift() || null);
+            }
+          } catch (_) {
+            // If even silence creation fails, skip forward
+            index += 1;
           }
-          cancelled = true;
-          return;
         }
       }
       // No more chunks; satisfy any remaining waiters with null
@@ -460,6 +537,13 @@ export default function VachanamrutCompanion() {
         });
       }
     };
+  };
+
+  const createSilenceBlob = (durationMs: number = 200): Blob => {
+    const sampleRate = 24000;
+    const samples = Math.max(1, Math.floor((durationMs / 1000) * sampleRate));
+    const pcm = new Uint8Array(samples * 2); // 16-bit mono zeros
+    return pcmToWav(pcm, sampleRate);
   };
 
   const pcmToWav = (pcmData: Uint8Array, sampleRate: number = 24000, numChannels: number = 1, bitsPerSample: number = 16): Blob => {
@@ -503,29 +587,158 @@ export default function VachanamrutCompanion() {
   };
 
   const fetchTtsBlob = async (textChunk: string): Promise<Blob> => {
+    const maxAttempts = 4;
+    let attempt = 0;
+    let lastErr: any = null;
+    while (attempt < maxAttempts) {
+      attempt += 1;
+      try {
+        // Respect global cooldown if set due to prior 429
+        const now = Date.now();
+        const waitUntil = ttsCooldownUntilRef.current || 0;
+        if (now < waitUntil) {
+          await new Promise(r => setTimeout(r, waitUntil - now));
+        }
+        const ttsResponse = await fetch('/api/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: textChunk })
+        });
+
+        if (!ttsResponse.ok) {
+          const errJson = await ttsResponse.json().catch(() => ({} as any));
+          // Handle 429 backoff using server-provided retryAfterMs when available
+          if (ttsResponse.status === 429) {
+            const waitMs = typeof errJson?.retryAfterMs === 'number' ? errJson.retryAfterMs : 6000 * attempt;
+            ttsCooldownUntilRef.current = Date.now() + waitMs;
+            await new Promise(r => setTimeout(r, waitMs));
+            continue;
+          }
+          throw new Error(errJson?.error || `Failed to generate speech (status ${ttsResponse.status})`);
+        }
+
+        const { audio, mimeType, originalMimeType } = await ttsResponse.json();
+        if (originalMimeType && (originalMimeType.includes('L16') || originalMimeType.includes('pcm'))) {
+          const byteCharacters = atob(audio);
+          const byteNumbers = new Array(byteCharacters.length);
+          for (let i = 0; i < byteCharacters.length; i++) {
+            byteNumbers[i] = byteCharacters.charCodeAt(i);
+          }
+          const pcmArray = new Uint8Array(byteNumbers);
+          return pcmToWav(pcmArray, 24000);
+        }
+        return base64ToBlob(audio, mimeType);
+      } catch (e) {
+        lastErr = e;
+        // small jittered backoff for transient failures
+        await new Promise(r => setTimeout(r, 500 + Math.random() * 500));
+      }
+    }
+    throw (lastErr instanceof Error ? lastErr : new Error('TTS failed after retries'));
+  };
+
+  const fetchTtsForCaching = async (textChunk: string): Promise<{ blob: Blob; audioBase64: string; mimeType: string; originalMimeType?: string }> => {
     const ttsResponse = await fetch('/api/tts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: textChunk })
     });
-
     if (!ttsResponse.ok) {
       const errorData = await ttsResponse.json().catch(() => ({}));
       throw new Error((errorData as any).error || 'Failed to generate speech');
     }
-
     const { audio, mimeType, originalMimeType } = await ttsResponse.json();
-
+    let blob: Blob;
     if (originalMimeType && (originalMimeType.includes('L16') || originalMimeType.includes('pcm'))) {
       const byteCharacters = atob(audio);
       const byteNumbers = new Array(byteCharacters.length);
-      for (let i = 0; i < byteCharacters.length; i++) {
-        byteNumbers[i] = byteCharacters.charCodeAt(i);
-      }
+      for (let i = 0; i < byteCharacters.length; i++) byteNumbers[i] = byteCharacters.charCodeAt(i);
       const pcmArray = new Uint8Array(byteNumbers);
-      return pcmToWav(pcmArray, 24000);
+      blob = pcmToWav(pcmArray, 24000);
+    } else {
+      blob = base64ToBlob(audio, mimeType);
     }
-    return base64ToBlob(audio, mimeType);
+    return { blob, audioBase64: audio, mimeType, originalMimeType };
+  };
+
+  const normalizeQuestion = (q: string) => {
+    return q
+      .normalize('NFKC')
+      .replace(/[\u0964\u0965\u0A83\u0ABD\u0AE0\u0AE1\u0AF0\u0AF1]/g, ' ')
+      .replace(/[\u0A80-\u0AFF]/g, (ch) => ch)
+      .replace(/[\p{P}\p{S}]/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  };
+  const QA_CACHE_KEY = 'vachanamrut_qa_cache_v1';
+  const QA_CACHE_LIMIT = 20;
+
+  const getFromQaCache = (question: string): QaCacheEntry | null => {
+    try {
+      const raw = localStorage.getItem(QA_CACHE_KEY);
+      if (!raw) return null;
+      const arr: QaCacheEntry[] = JSON.parse(raw);
+      const key = normalizeQuestion(question);
+      return arr.find(e => normalizeQuestion(e.question) === key) || null;
+    } catch {
+      return null;
+    }
+  };
+
+  const trySaveToQaCache = (question: string, answer: string, ttsParts: CachedTtsPart[], append: boolean = true) => {
+    try {
+      const entry: QaCacheEntry = { question, answer, ttsParts };
+      const raw = localStorage.getItem(QA_CACHE_KEY);
+      let arr: QaCacheEntry[] = [];
+      if (raw) {
+        arr = JSON.parse(raw);
+        const key = normalizeQuestion(question);
+        const idx = arr.findIndex(e => normalizeQuestion(e.question) === key);
+        if (idx >= 0) {
+          if (append && ttsParts && ttsParts.length > 0) {
+            const existing = arr[idx];
+            existing.answer = answer || existing.answer;
+            existing.ttsParts = [...(existing.ttsParts || []), ...ttsParts];
+            arr.splice(idx, 1);
+            arr.unshift(existing);
+            localStorage.setItem(QA_CACHE_KEY, JSON.stringify(arr.slice(0, QA_CACHE_LIMIT)));
+            return;
+          } else {
+            arr.splice(idx, 1);
+          }
+        }
+      }
+      arr.unshift(entry);
+      if (arr.length > QA_CACHE_LIMIT) arr = arr.slice(0, QA_CACHE_LIMIT);
+      localStorage.setItem(QA_CACHE_KEY, JSON.stringify(arr));
+    } catch {
+      // ignore cache write errors
+    }
+  };
+
+  const speakFromCachedParts = async (parts: CachedTtsPart[]) => {
+    setIsSpeaking(true);
+    speakCancelRef.current = false;
+    try {
+      for (let i = 0; i < parts.length && !speakCancelRef.current; i++) {
+        const p = parts[i];
+        let blob: Blob;
+        if (p.originalMimeType && (p.originalMimeType.includes('L16') || p.originalMimeType.includes('pcm'))) {
+          const byteCharacters = atob(p.audio);
+          const byteNumbers = new Array(byteCharacters.length);
+          for (let j = 0; j < byteCharacters.length; j++) byteNumbers[j] = byteCharacters.charCodeAt(j);
+          const pcmArray = new Uint8Array(byteNumbers);
+          blob = pcmToWav(pcmArray, 24000);
+        } else {
+          blob = base64ToBlob(p.audio, p.mimeType);
+        }
+        await playAudioBlob(blob);
+      }
+    } finally {
+      setIsSpeaking(false);
+      audioElementRef.current = null;
+    }
   };
 
   const chunkTextForTts = (fullText: string, targetChunkSize: number): string[] => {
@@ -679,7 +892,7 @@ export default function VachanamrutCompanion() {
           )}
 
           {/* Current Conversation */}
-          {(transcript || response) && (
+          {(transcript || displayResponse) && (
             <div className="space-y-4 mb-6">
               {transcript && (
                 <div className="bg-blue-50 p-4 rounded-lg border-l-4 border-blue-500">
@@ -687,10 +900,10 @@ export default function VachanamrutCompanion() {
                   <p className="text-gray-800">{transcript}</p>
                 </div>
               )}
-              {response && (
+              {displayResponse && (
                 <div className="bg-orange-50 p-4 rounded-lg border-l-4 border-orange-500">
                   <p className="text-sm text-orange-600 font-semibold mb-1">Answer:</p>
-                  <p className="text-gray-800 whitespace-pre-wrap">{response}</p>
+                  <p className="text-gray-800 whitespace-pre-wrap">{displayResponse}</p>
                 </div>
               )}
             </div>
