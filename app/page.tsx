@@ -54,6 +54,9 @@ export default function VachanamrutCompanion() {
   
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
+  const speakCancelRef = useRef<boolean>(false);
+  const ttsWarmedUpRef = useRef<boolean>(false);
+  const ttsCancelPrefetchRef = useRef<() => void>(() => {});
 
   const processQuery = useCallback(async (query: string) => {
     setIsProcessing(true);
@@ -126,6 +129,24 @@ export default function VachanamrutCompanion() {
     };
   }, [processQuery]);
 
+  // Warm up TTS on first client render to reduce first-call latency
+  useEffect(() => {
+    if (ttsWarmedUpRef.current) return;
+    ttsWarmedUpRef.current = true;
+    // Fire-and-forget a very short TTS request; do not play the audio
+    (async () => {
+      try {
+        await fetch('/api/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: '.' })
+        });
+      } catch (_) {
+        // Ignore warm-up errors
+      }
+    })();
+  }, []);
+
   const startListening = () => {
     if (recognitionRef.current) {
       setError('');
@@ -148,68 +169,64 @@ export default function VachanamrutCompanion() {
   const speakResponse = async (text: string) => {
     console.log('Frontend: Starting TTS for text:', text.substring(0, 50) + '...');
     setIsSpeaking(true);
+    speakCancelRef.current = false;
 
     try {
-      // Get audio from TTS API
-      const ttsResponse = await fetch('/api/tts', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ text }),
-      });
-
-      console.log('Frontend: TTS response status:', ttsResponse.status);
-
-      if (!ttsResponse.ok) {
-        const errorData = await ttsResponse.json();
-        console.error('Frontend: TTS error:', errorData);
-        throw new Error(errorData.error || 'Failed to generate speech');
+      const chunks = chunkTextForTts(text, 100);
+      if (chunks.length === 0) {
+        setIsSpeaking(false);
+        return;
       }
 
-      const { audio, mimeType, originalMimeType } = await ttsResponse.json();
-      console.log('Frontend: Received audio, mimeType:', mimeType, 'original:', originalMimeType);
+      // Create a background prefetcher that continuously fetches next chunks while audio is playing
+      const prefetcher = createTtsPrefetcher(chunks);
+      ttsCancelPrefetchRef.current = prefetcher.cancel;
 
-      // Convert base64 to audio and play
-      let audioBlob;
-      
-      if (originalMimeType && (originalMimeType.includes('L16') || originalMimeType.includes('pcm'))) {
-        console.log('Frontend: Converting PCM to WAV...');
-        const byteCharacters = atob(audio);
-        const byteNumbers = new Array(byteCharacters.length);
-        for (let i = 0; i < byteCharacters.length; i++) {
-          byteNumbers[i] = byteCharacters.charCodeAt(i);
+      const firstBlob = await prefetcher.next();
+      if (!firstBlob || speakCancelRef.current) {
+        prefetcher.cancel();
+        setIsSpeaking(false);
+        return;
+      }
+
+      const playLoop = async (initialBlob: Blob) => {
+        let currentBlob: Blob | null = initialBlob;
+        while (currentBlob && !speakCancelRef.current) {
+          const audioUrl = URL.createObjectURL(currentBlob);
+          const audioElement = new Audio(audioUrl);
+          audioElementRef.current = audioElement;
+
+          const nextBlobPromise = prefetcher.next(); // Start waiting for the next chunk while current plays
+
+          const playPromise = audioElement.play();
+          audioElement.onerror = (e) => {
+            console.error('Frontend: Audio playback error:', e);
+            setIsSpeaking(false);
+            audioElementRef.current = null;
+            setError('Failed to play audio');
+          };
+
+          await playPromise.catch((e) => {
+            console.error('Frontend: Audio play() failed:', e);
+            setIsSpeaking(false);
+          });
+
+          await new Promise<void>((resolve) => {
+            audioElement.onended = () => {
+              URL.revokeObjectURL(audioUrl);
+              resolve();
+            };
+          });
+
+          if (speakCancelRef.current) break;
+          currentBlob = await nextBlobPromise;
         }
-        const pcmArray = new Uint8Array(byteNumbers);
-        audioBlob = pcmToWav(pcmArray, 24000);
-        console.log('Frontend: Created WAV blob from PCM, size:', audioBlob.size);
-      } else {
-        audioBlob = base64ToBlob(audio, mimeType);
-        console.log('Frontend: Created audio blob, size:', audioBlob.size);
-      }
-      
-      const audioUrl = URL.createObjectURL(audioBlob);
-      const audioElement = new Audio(audioUrl);
-      audioElementRef.current = audioElement;
 
-      audioElement.onended = () => {
-        console.log('Frontend: Audio playback ended');
         setIsSpeaking(false);
         audioElementRef.current = null;
-        URL.revokeObjectURL(audioUrl);
       };
 
-      audioElement.onerror = (e) => {
-        console.error('Frontend: Audio playback error:', e);
-        setIsSpeaking(false);
-        audioElementRef.current = null;
-        setError('Failed to play audio');
-        URL.revokeObjectURL(audioUrl);
-      };
-
-      console.log('Frontend: Starting audio playback...');
-      await audioElement.play();
-      console.log('Frontend: Audio is playing');
+      await playLoop(firstBlob);
     } catch (err) {
       setIsSpeaking(false);
       audioElementRef.current = null;
@@ -219,6 +236,10 @@ export default function VachanamrutCompanion() {
 
   const stopAudio = () => {
     console.log('Frontend: Stopping audio playback');
+    speakCancelRef.current = true;
+    try {
+      ttsCancelPrefetchRef.current && ttsCancelPrefetchRef.current();
+    } catch {}
     if (audioElementRef.current) {
       audioElementRef.current.pause();
       audioElementRef.current.currentTime = 0;
@@ -235,6 +256,59 @@ export default function VachanamrutCompanion() {
     }
     const byteArray = new Uint8Array(byteNumbers);
     return new Blob([byteArray], { type: mimeType });
+  };
+
+  const createTtsPrefetcher = (chunks: string[]) => {
+    let cancelled = false;
+    let index = 0;
+    const queue: Blob[] = [];
+    const waiters: Array<(b: Blob | null) => void> = [];
+
+    const fetchSequentially = async () => {
+      while (!cancelled && index < chunks.length) {
+        try {
+          const blob = await fetchTtsBlob(chunks[index]);
+          if (cancelled) return;
+          queue.push(blob);
+          index += 1;
+          if (waiters.length > 0) {
+            const resolve = waiters.shift();
+            resolve && resolve(queue.shift() || null);
+          }
+        } catch (e) {
+          if (cancelled) return;
+          // On fetch error, push null to unblock waiter and stop further prefetching
+          while (waiters.length > 0) {
+            const resolve = waiters.shift();
+            resolve && resolve(null);
+          }
+          cancelled = true;
+          return;
+        }
+      }
+      // No more chunks; satisfy any remaining waiters with null
+      while (waiters.length > 0) {
+        const resolve = waiters.shift();
+        resolve && resolve(null);
+      }
+    };
+
+    // kick off
+    fetchSequentially();
+
+    return {
+      cancel: () => {
+        cancelled = true;
+      },
+      next: (): Promise<Blob | null> => {
+        if (queue.length > 0) {
+          return Promise.resolve(queue.shift() as Blob);
+        }
+        return new Promise((resolve) => {
+          waiters.push(resolve);
+        });
+      }
+    };
   };
 
   const pcmToWav = (pcmData: Uint8Array, sampleRate: number = 24000, numChannels: number = 1, bitsPerSample: number = 16): Blob => {
@@ -275,6 +349,96 @@ export default function VachanamrutCompanion() {
     combinedArray.set(headerArray, 0);
     combinedArray.set(pcmData, headerArray.length);
     return new Blob([combinedArray], { type: 'audio/wav' });
+  };
+
+  const fetchTtsBlob = async (textChunk: string): Promise<Blob> => {
+    const ttsResponse = await fetch('/api/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: textChunk })
+    });
+
+    if (!ttsResponse.ok) {
+      const errorData = await ttsResponse.json().catch(() => ({}));
+      throw new Error((errorData as any).error || 'Failed to generate speech');
+    }
+
+    const { audio, mimeType, originalMimeType } = await ttsResponse.json();
+
+    if (originalMimeType && (originalMimeType.includes('L16') || originalMimeType.includes('pcm'))) {
+      const byteCharacters = atob(audio);
+      const byteNumbers = new Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i++) {
+        byteNumbers[i] = byteCharacters.charCodeAt(i);
+      }
+      const pcmArray = new Uint8Array(byteNumbers);
+      return pcmToWav(pcmArray, 24000);
+    }
+    return base64ToBlob(audio, mimeType);
+  };
+
+  const chunkTextForTts = (fullText: string, targetChunkSize: number): string[] => {
+    const text = fullText.replace(/\s+/g, ' ').trim();
+    if (!text) return [];
+
+    // 1) Split into sentences
+    const sentences = text.split(/(?<=[.!?])\s+/).filter(Boolean);
+
+    const chunks: string[] = [];
+
+    const pushSmart = (piece: string) => {
+      const trimmed = piece.trim();
+      if (!trimmed) return;
+      if (trimmed.length <= targetChunkSize) {
+        chunks.push(trimmed);
+        return;
+      }
+      // 3) If clause still too long, split by words to enforce hard cap
+      const words = trimmed.split(/\s+/);
+      let buf = '';
+      for (const w of words) {
+        const candidate = buf ? buf + ' ' + w : w;
+        if (candidate.length <= targetChunkSize) {
+          buf = candidate;
+        } else {
+          if (buf) chunks.push(buf);
+          buf = w;
+        }
+      }
+      if (buf) chunks.push(buf);
+    };
+
+    for (const sentence of sentences) {
+      if (sentence.length <= targetChunkSize) {
+        chunks.push(sentence);
+        continue;
+      }
+      // 2) Further split long sentences into clauses by commas/semicolons
+      const clauses = sentence.split(/[,;]+\s*/).filter(Boolean);
+      let current = '';
+      for (const clause of clauses) {
+        const candidate = current ? current + ', ' + clause : clause;
+        if (candidate.length <= targetChunkSize) {
+          current = candidate;
+        } else {
+          if (current) pushSmart(current);
+          pushSmart(clause);
+          current = '';
+        }
+      }
+      if (current) pushSmart(current);
+    }
+
+    // Fallback for text without punctuation at all
+    if (chunks.length === 0) {
+      let i = 0;
+      while (i < text.length) {
+        chunks.push(text.slice(i, i + targetChunkSize));
+        i += targetChunkSize;
+      }
+    }
+
+    return chunks;
   };
 
   return (
