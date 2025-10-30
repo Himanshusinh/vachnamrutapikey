@@ -57,6 +57,9 @@ export default function VachanamrutCompanion() {
   const speakCancelRef = useRef<boolean>(false);
   const ttsWarmedUpRef = useRef<boolean>(false);
   const ttsCancelPrefetchRef = useRef<() => void>(() => {});
+  const ttsStartedRef = useRef<boolean>(false);
+  const ttsCursorRef = useRef<number>(0); // index in `response` up to which TTS has been spoken
+  const streamingDoneRef = useRef<boolean>(false);
 
   const processQuery = useCallback(async (query: string) => {
     setIsProcessing(true);
@@ -77,13 +80,12 @@ export default function VachanamrutCompanion() {
       }
 
       const { answer } = await geminiResponse.json();
-      setResponse(answer);
 
-      // Add to history
+      // Add to history immediately (we still stream the UI)
       setHistory(prev => [...prev, { query, answer }]);
 
-      // Convert answer to speech
-      await speakResponse(answer);
+      // Stream the answer in UI and start TTS after ~100 tokens
+      streamAnswerWithParallelTts(answer);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
@@ -246,6 +248,155 @@ export default function VachanamrutCompanion() {
       audioElementRef.current = null;
     }
     setIsSpeaking(false);
+  };
+
+  const streamAnswerWithParallelTts = (fullAnswer: string) => {
+    // Reset streaming/TTS state
+    setResponse('');
+    ttsStartedRef.current = false;
+    ttsCursorRef.current = 0;
+    streamingDoneRef.current = false;
+    speakCancelRef.current = false;
+
+    // Prepare TTS parts up-front from the full answer
+    const ttsParts = partitionAnswerForTts(fullAnswer);
+
+    // Kick off TTS streamer loop for these parts
+    startTtsStreamerWithParts(ttsParts);
+
+    // Stream words into the UI like ChatGPT
+    const words = fullAnswer.split(/\s+/).filter(Boolean);
+    let i = 0;
+
+    const pump = () => {
+      if (i >= words.length) {
+        streamingDoneRef.current = true;
+        return;
+      }
+      // Append next word
+      setResponse(prev => (prev ? prev + ' ' + words[i] : words[i]));
+      i += 1;
+
+      // Allow TTS to begin immediately; streamer will play as soon as part 1 is fetched
+      if (!ttsStartedRef.current) ttsStartedRef.current = true;
+
+      // Adjust delay for a natural feel
+      const delay = words[i - 1].length > 6 ? 30 : 18;
+      setTimeout(pump, delay);
+    };
+
+    pump();
+  };
+
+  const startTtsStreamerWithParts = (parts: string[]) => {
+    // Runs in background, speaking provided parts while prefetching next
+    (async () => {
+      try {
+        // Wait until allowed to start
+        while (!ttsStartedRef.current && !speakCancelRef.current) {
+          await new Promise(r => setTimeout(r, 100));
+        }
+        if (speakCancelRef.current) return;
+
+        setIsSpeaking(true);
+        // Prefetcher for provided parts
+        const prefetcher = createTtsPrefetcher(parts);
+        ttsCancelPrefetchRef.current = prefetcher.cancel;
+
+        // Fetch first audio
+        let currentBlob = await prefetcher.next();
+        if (speakCancelRef.current) return;
+
+        while (currentBlob && !speakCancelRef.current) {
+          const nextBlobPromise = prefetcher.next();
+          await playAudioBlob(currentBlob);
+          if (speakCancelRef.current) break;
+          currentBlob = await nextBlobPromise;
+        }
+      } finally {
+        setIsSpeaking(false);
+        audioElementRef.current = null;
+      }
+    })();
+  };
+
+  const partitionAnswerForTts = (fullText: string): string[] => {
+    const text = fullText.replace(/\s+/g, ' ').trim();
+    if (!text) return [];
+
+    const lines = deriveNaturalLines(text);
+    if (lines.length <= 1) return [text];
+
+    // Split into two halves of lines: first half, then second half
+    const mid = Math.ceil(lines.length / 2);
+    const firstHalf = lines.slice(0, mid).join(' ');
+    const secondHalf = lines.slice(mid).join(' ');
+
+    // If the second half is extremely short, merge back into one part
+    if (secondHalf.length < 60) return [firstHalf + ' ' + secondHalf];
+
+    return [firstHalf, secondHalf];
+  };
+
+  const deriveNaturalLines = (text: string): string[] => {
+    // Prefer explicit newlines if present
+    const hasNewlines = /\n/.test(text);
+    if (hasNewlines) {
+      const byNewline = text.split(/\n+/).map(s => s.trim()).filter(Boolean);
+      if (byNewline.length >= 2) return byNewline;
+    }
+
+    // Fallback: sentence-aware grouping into visual "lines" around ~120 chars
+    const sentences = text.split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean);
+    if (sentences.length <= 2) return [text];
+
+    const targetLen = 120; // approximate visual line length
+    const lines: string[] = [];
+    let buf = '';
+    for (const s of sentences) {
+      const candidate = buf ? buf + ' ' + s : s;
+      if (candidate.length <= targetLen || !buf) {
+        buf = candidate;
+      } else {
+        lines.push(buf);
+        buf = s;
+      }
+    }
+    if (buf) lines.push(buf);
+
+    // Cap to at most 6 lines for coherence
+    if (lines.length > 6) {
+      const merged: string[] = [];
+      let acc = '';
+      for (const l of lines) {
+        const c = acc ? acc + ' ' + l : l;
+        if (c.length <= targetLen * 1.2) acc = c; else { merged.push(acc); acc = l; }
+      }
+      if (acc) merged.push(acc);
+      return merged;
+    }
+    return lines;
+  };
+
+  const playAudioBlob = async (blob: Blob) => {
+    return new Promise<void>((resolve) => {
+      const audioUrl = URL.createObjectURL(blob);
+      const audioElement = new Audio(audioUrl);
+      audioElementRef.current = audioElement;
+      audioElement.onerror = () => {
+        URL.revokeObjectURL(audioUrl);
+        resolve();
+      };
+      audioElement.onended = () => {
+        URL.revokeObjectURL(audioUrl);
+        resolve();
+      };
+      const p = audioElement.play();
+      p.catch(() => {
+        URL.revokeObjectURL(audioUrl);
+        resolve();
+      });
+    });
   };
 
   const base64ToBlob = (base64: string, mimeType: string) => {
@@ -577,3 +728,4 @@ export default function VachanamrutCompanion() {
     </div>
   );
 }
+

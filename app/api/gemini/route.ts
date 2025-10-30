@@ -55,14 +55,19 @@ CRITICAL INSTRUCTIONS:
 
 6. Be respectful and reverent when discussing the Vachanamrut teachings.
 
+7. Response length policy to optimize speed and clarity:
+   - Default to short or medium answers (aim 60–140 words) that are accurate and to the point.
+   - Only provide long, detailed answers if explicitly requested or clearly necessary for correctness.
+   - Prefer bullet points and short sentences when appropriate.
+
 Question: ${query}`
                 }
               ]
             }
           ],
           generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 2048,
+            temperature: 0.5,
+            maxOutputTokens: 512,
             candidateCount: 1,
           }
         }),
