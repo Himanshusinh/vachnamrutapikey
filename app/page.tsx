@@ -44,7 +44,30 @@ interface SpeechRecognitionErrorEvent {
 }
 
 export default function VachanamrutCompanion() {
-  const API_BASE = process.env.NEXT_PUBLIC_BACKEND_URL;
+  // Normalize and validate backend URL
+  const getApiBase = () => {
+    const url = process.env.NEXT_PUBLIC_BACKEND_URL || '';
+    if (!url) return '';
+    
+    // Remove any trailing slashes and invalid concatenations
+    let cleanUrl = url.trim();
+    
+    // Check for malformed URLs (e.g., "ngrok.comhttp://localhost")
+    if (cleanUrl.includes('http://') && cleanUrl.includes('https://')) {
+      // If both protocols exist, take the first https:// one
+      const httpsMatch = cleanUrl.match(/https?:\/\/[^\s]+/);
+      if (httpsMatch) {
+        cleanUrl = httpsMatch[0];
+      }
+    }
+    
+    // Remove trailing slash
+    cleanUrl = cleanUrl.replace(/\/+$/, '');
+    
+    return cleanUrl;
+  };
+
+  const API_BASE = getApiBase();
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [response, setResponse] = useState('');
@@ -59,7 +82,11 @@ export default function VachanamrutCompanion() {
   // Check if backend URL is configured
   useEffect(() => {
     if (!API_BASE) {
-      setError('Backend server not configured. Please set NEXT_PUBLIC_BACKEND_URL environment variable.');
+      setError('Backend server not configured. Please set NEXT_PUBLIC_BACKEND_URL environment variable in Vercel.');
+    } else if (!API_BASE.startsWith('http://') && !API_BASE.startsWith('https://')) {
+      setError(`Invalid backend URL format: ${API_BASE}. URL must start with http:// or https://`);
+    } else {
+      console.log('Backend URL configured:', API_BASE);
     }
   }, [API_BASE]);
 
