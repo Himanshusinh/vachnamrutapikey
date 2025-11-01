@@ -119,18 +119,26 @@ export default function VachanamrutCompanion() {
       // Add to history
       setHistory(prev => [...prev, { query, answer }]);
 
+      // Set processing to false immediately after getting answer
+      // So mic button is enabled while audio is playing
+      setIsProcessing(false);
+
+      // Start audio playback in background (don't await - let it play while mic is enabled)
       // If we have cached audio parts, use them directly (no API call needed)
       if (fromCache && ttsParts && ttsParts.length > 0) {
         console.log('Using cached audio - no TTS API call needed');
-        await speakFromCachedAudio(ttsParts);
+        speakFromCachedAudio(ttsParts).catch(err => {
+          console.error('Error playing cached audio:', err);
+        });
       } else {
         // New question - generate TTS and save to history
         console.log('New question - generating TTS...');
-        await speakResponse(answer, query);
+        speakResponse(answer, query).catch(err => {
+          console.error('Error playing audio:', err);
+        });
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
-    } finally {
       setIsProcessing(false);
     }
   }, [API_BASE]);
@@ -156,7 +164,10 @@ export default function VachanamrutCompanion() {
 
       recognitionRef.current.onerror = (event: SpeechRecognitionErrorEvent) => {
         console.error('Speech recognition error:', event.error);
-        setError(`Voice recognition error: ${event.error}`);
+        // Don't show error for "no-speech" or "aborted" errors - these are normal
+        if (event.error !== 'no-speech' && event.error !== 'aborted') {
+          setError(`Voice recognition error: ${event.error}`);
+        }
         setIsListening(false);
       };
 
@@ -174,26 +185,119 @@ export default function VachanamrutCompanion() {
   }, [processQuery]);
 
   const startListening = () => {
-    if (recognitionRef.current) {
-      // Stop any playing audio when mic is activated
-      if (isSpeaking) {
-        stopAudio();
+    // Stop any playing audio when mic is activated
+    if (isSpeaking) {
+      stopAudio();
+    }
+    
+    // Reinitialize recognition if it doesn't exist or is in a bad state
+    if (!recognitionRef.current) {
+      if (typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)) {
+        const SpeechRecognition = (window as SpeechRecognitionWindow).SpeechRecognition || (window as SpeechRecognitionWindow).webkitSpeechRecognition;
+        if (SpeechRecognition) {
+          recognitionRef.current = new SpeechRecognition();
+          recognitionRef.current.continuous = false;
+          recognitionRef.current.interimResults = false;
+          recognitionRef.current.lang = 'gu-IN';
+
+          recognitionRef.current.onresult = async (event: SpeechRecognitionEvent) => {
+            const speechToText = event.results[0][0].transcript;
+            setTranscript(speechToText);
+            setIsListening(false);
+            
+            // Automatically process the query
+            await processQuery(speechToText);
+          };
+
+          recognitionRef.current.onerror = (event: SpeechRecognitionErrorEvent) => {
+            console.error('Speech recognition error:', event.error);
+            // Don't show error for "no-speech" or "aborted" errors - these are normal
+            if (event.error !== 'no-speech' && event.error !== 'aborted') {
+              setError(`Voice recognition error: ${event.error}`);
+            }
+            setIsListening(false);
+          };
+
+          recognitionRef.current.onend = () => {
+            setIsListening(false);
+          };
+        }
       }
-      
-      setError('');
-      setTranscript('');
-      setResponse('');
-      setIsListening(true);
-      recognitionRef.current.start();
+    }
+    
+    if (recognitionRef.current) {
+      try {
+        setError('');
+        setTranscript('');
+        setResponse('');
+        setIsListening(true);
+        recognitionRef.current.start();
+        console.log('Frontend: Speech recognition started');
+      } catch (e) {
+        console.error('Error starting recognition:', e);
+        setIsListening(false);
+        setError('Failed to start speech recognition. Please try again.');
+        
+        // Try to reinitialize if start failed
+        recognitionRef.current = null;
+      }
     } else {
       setError('Speech recognition not supported in your browser');
     }
   };
 
   const stopListening = () => {
+    console.log('Frontend: Stopping speech recognition');
     if (recognitionRef.current) {
-      recognitionRef.current.stop();
+      try {
+        recognitionRef.current.stop();
+      } catch (e) {
+        console.error('Error stopping recognition:', e);
+      }
       setIsListening(false);
+      
+      // Reinitialize recognition to ensure it can be used again
+      // The SpeechRecognition API sometimes gets stuck after stopping
+      setTimeout(() => {
+        if (typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)) {
+          const SpeechRecognition = (window as SpeechRecognitionWindow).SpeechRecognition || (window as SpeechRecognitionWindow).webkitSpeechRecognition;
+          if (SpeechRecognition) {
+            try {
+              // Create a new recognition instance to ensure it's fresh
+              recognitionRef.current = new SpeechRecognition();
+              recognitionRef.current.continuous = false;
+              recognitionRef.current.interimResults = false;
+              recognitionRef.current.lang = 'gu-IN';
+
+              recognitionRef.current.onresult = async (event: SpeechRecognitionEvent) => {
+                const speechToText = event.results[0][0].transcript;
+                setTranscript(speechToText);
+                setIsListening(false);
+                
+                // Automatically process the query
+                await processQuery(speechToText);
+              };
+
+              recognitionRef.current.onerror = (event: SpeechRecognitionErrorEvent) => {
+                console.error('Speech recognition error:', event.error);
+                // Don't show error for "no-speech" or "aborted" errors - these are normal
+                if (event.error !== 'no-speech' && event.error !== 'aborted') {
+                  setError(`Voice recognition error: ${event.error}`);
+                }
+                setIsListening(false);
+              };
+
+              recognitionRef.current.onend = () => {
+                setIsListening(false);
+              };
+              
+              console.log('Frontend: Speech recognition reinitialized, ready for next use');
+            } catch (e) {
+              console.error('Error reinitializing recognition:', e);
+            }
+          }
+        }
+      }, 100); // Small delay to ensure cleanup
     }
   };
 
