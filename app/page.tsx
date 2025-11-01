@@ -44,6 +44,7 @@ interface SpeechRecognitionErrorEvent {
 }
 
 export default function VachanamrutCompanion() {
+  const API_BASE = process.env.NEXT_PUBLIC_BACKEND_URL;
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [response, setResponse] = useState('');
@@ -55,13 +56,25 @@ export default function VachanamrutCompanion() {
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
 
+  // Check if backend URL is configured
+  useEffect(() => {
+    if (!API_BASE) {
+      setError('Backend server not configured. Please set NEXT_PUBLIC_BACKEND_URL environment variable.');
+    }
+  }, [API_BASE]);
+
   const processQuery = useCallback(async (query: string) => {
+    if (!API_BASE) {
+      setError('Backend server URL not configured. Please set NEXT_PUBLIC_BACKEND_URL in your .env.local file.');
+      return;
+    }
+
     setIsProcessing(true);
     setError('');
 
     try {
-      // Get answer from Gemini API
-      const geminiResponse = await fetch('/api/gemini', {
+      // Get answer from backend (backend will check history first)
+      const geminiResponse = await fetch(`${API_BASE}/api/gemini`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -73,20 +86,27 @@ export default function VachanamrutCompanion() {
         throw new Error('Failed to get response from AI');
       }
 
-      const { answer } = await geminiResponse.json();
+      const { answer, fromCache, ttsParts } = await geminiResponse.json();
       setResponse(answer);
 
       // Add to history
       setHistory(prev => [...prev, { query, answer }]);
 
-      // Convert answer to speech
-      await speakResponse(answer);
+      // If we have cached audio parts, use them directly (no API call needed)
+      if (fromCache && ttsParts && ttsParts.length > 0) {
+        console.log('Using cached audio - no TTS API call needed');
+        await speakFromCachedAudio(ttsParts);
+      } else {
+        // New question - generate TTS and save to history
+        console.log('New question - generating TTS...');
+        await speakResponse(answer, query);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
       setIsProcessing(false);
     }
-  }, []);
+  }, [API_BASE]);
 
   useEffect(() => {
     // Initialize Speech Recognition
@@ -145,13 +165,69 @@ export default function VachanamrutCompanion() {
     }
   };
 
-  const speakResponse = async (text: string) => {
-    console.log('Frontend: Starting TTS for text:', text.substring(0, 50) + '...');
+  // Play audio from cached parts (no API call)
+  const speakFromCachedAudio = async (ttsParts: Array<{ audio: string; mimeType: string; originalMimeType?: string }>) => {
+    console.log('Frontend: Using cached audio - no TTS API call needed');
     setIsSpeaking(true);
 
     try {
-      // Get audio from TTS API
-      const ttsResponse = await fetch('/api/tts', {
+      for (let i = 0; i < ttsParts.length; i++) {
+        const part = ttsParts[i];
+        let audioBlob: Blob;
+        
+        if (part.originalMimeType && (part.originalMimeType.includes('L16') || part.originalMimeType.includes('pcm'))) {
+          console.log(`Frontend: Converting cached PCM part ${i} to WAV...`);
+          const byteCharacters = atob(part.audio);
+          const byteNumbers = new Array(byteCharacters.length);
+          for (let j = 0; j < byteCharacters.length; j++) {
+            byteNumbers[j] = byteCharacters.charCodeAt(j);
+          }
+          const pcmArray = new Uint8Array(byteNumbers);
+          audioBlob = pcmToWav(pcmArray, 24000);
+        } else {
+          audioBlob = base64ToBlob(part.audio, part.mimeType);
+        }
+        
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audioElement = new Audio(audioUrl);
+        audioElementRef.current = audioElement;
+
+        await new Promise<void>((resolve) => {
+          audioElement.onended = () => {
+            URL.revokeObjectURL(audioUrl);
+            resolve();
+          };
+          audioElement.onerror = () => {
+            URL.revokeObjectURL(audioUrl);
+            resolve();
+          };
+          audioElement.play().catch(() => resolve());
+        });
+      }
+      setIsSpeaking(false);
+      audioElementRef.current = null;
+    } catch (err) {
+      setIsSpeaking(false);
+      audioElementRef.current = null;
+      setError(err instanceof Error ? err.message : 'Failed to play cached audio');
+    }
+  };
+
+  // Generate new TTS and save to history
+  const speakResponse = async (text: string, question?: string) => {
+    if (!API_BASE) {
+      setError('Backend server URL not configured.');
+      return;
+    }
+
+    console.log('Frontend: Starting TTS for text:', text.substring(0, 50) + '...');
+    setIsSpeaking(true);
+
+    const sessionTimestamp = Date.now();
+
+    try {
+      // Get audio from TTS API via backend
+      const ttsResponse = await fetch(`${API_BASE}/api/tts`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -188,6 +264,23 @@ export default function VachanamrutCompanion() {
         console.log('Frontend: Created audio blob, size:', audioBlob.size);
       }
       
+      // Save audio to history in background
+      if (question) {
+        fetch(`${API_BASE}/api/history/save-audio`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            audioBase64: audio,
+            mimeType,
+            originalMimeType,
+            question,
+            answer: text,
+            index: 0,
+            timestamp: sessionTimestamp
+          })
+        }).catch(err => console.error('Failed to save audio to history:', err));
+      }
+
       const audioUrl = URL.createObjectURL(audioBlob);
       const audioElement = new Audio(audioUrl);
       audioElementRef.current = audioElement;
