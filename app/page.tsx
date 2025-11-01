@@ -220,9 +220,23 @@ export default function VachanamrutCompanion() {
         audioElementRef.current = audioElement;
 
         await new Promise<void>((resolve) => {
+          // Check if audio element was cleared (meaning stop was clicked)
+          const checkStopped = () => {
+            if (!audioElementRef.current || audioElementRef.current !== audioElement) {
+              URL.revokeObjectURL(audioUrl);
+              resolve();
+              return true;
+            }
+            return false;
+          };
+
+          if (checkStopped()) return;
+
           audioElement.onended = () => {
-            URL.revokeObjectURL(audioUrl);
-            resolve();
+            if (!checkStopped()) {
+              URL.revokeObjectURL(audioUrl);
+              resolve();
+            }
           };
           audioElement.onerror = () => {
             URL.revokeObjectURL(audioUrl);
@@ -230,12 +244,23 @@ export default function VachanamrutCompanion() {
           };
           audioElement.play().catch(() => resolve());
         });
+
+        // Check if stopped between parts
+        if (!audioElementRef.current) {
+          console.log('Frontend: Audio playback cancelled between parts');
+          break;
+        }
       }
       setIsSpeaking(false);
-      audioElementRef.current = null;
+      // Only clear if it's still our audio element
+      if (audioElementRef.current) {
+        audioElementRef.current = null;
+      }
     } catch (err) {
       setIsSpeaking(false);
-      audioElementRef.current = null;
+      if (audioElementRef.current) {
+        audioElementRef.current = null;
+      }
       setError(err instanceof Error ? err.message : 'Failed to play cached audio');
     }
   };
@@ -339,12 +364,21 @@ export default function VachanamrutCompanion() {
 
   const stopAudio = () => {
     console.log('Frontend: Stopping audio playback');
+    // Set speaking to false first to enable mic button immediately
+    setIsSpeaking(false);
+    
+    // Stop and clean up audio element
     if (audioElementRef.current) {
-      audioElementRef.current.pause();
-      audioElementRef.current.currentTime = 0;
+      try {
+        audioElementRef.current.pause();
+        audioElementRef.current.currentTime = 0;
+      } catch (e) {
+        console.error('Error stopping audio:', e);
+      }
       audioElementRef.current = null;
     }
-    setIsSpeaking(false);
+    
+    console.log('Frontend: Audio stopped, microphone button enabled');
   };
 
   const base64ToBlob = (base64: string, mimeType: string) => {
