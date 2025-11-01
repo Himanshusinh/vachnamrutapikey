@@ -175,6 +175,11 @@ export default function VachanamrutCompanion() {
 
   const startListening = () => {
     if (recognitionRef.current) {
+      // Stop any playing audio when mic is activated
+      if (isSpeaking) {
+        stopAudio();
+      }
+      
       setError('');
       setTranscript('');
       setResponse('');
@@ -195,6 +200,10 @@ export default function VachanamrutCompanion() {
   // Play audio from cached parts (no API call)
   const speakFromCachedAudio = async (ttsParts: Array<{ audio: string; mimeType: string; originalMimeType?: string }>) => {
     console.log('Frontend: Using cached audio - no TTS API call needed');
+    // Stop mic if it's listening when audio starts
+    if (isListening) {
+      stopListening();
+    }
     setIsSpeaking(true);
 
     try {
@@ -251,11 +260,12 @@ export default function VachanamrutCompanion() {
           break;
         }
       }
-      setIsSpeaking(false);
-      // Only clear if it's still our audio element
+      // Only set speaking to false if audio element still exists (wasn't stopped)
       if (audioElementRef.current) {
+        setIsSpeaking(false);
         audioElementRef.current = null;
       }
+      // If audio was stopped, isSpeaking is already false from stopAudio()
     } catch (err) {
       setIsSpeaking(false);
       if (audioElementRef.current) {
@@ -270,6 +280,11 @@ export default function VachanamrutCompanion() {
     if (!API_BASE) {
       setError('Backend server URL not configured.');
       return;
+    }
+
+    // Stop mic if it's listening when audio starts
+    if (isListening) {
+      stopListening();
     }
 
     console.log('Frontend: Starting TTS for text:', text.substring(0, 50) + '...');
@@ -339,16 +354,22 @@ export default function VachanamrutCompanion() {
 
       audioElement.onended = () => {
         console.log('Frontend: Audio playback ended');
-        setIsSpeaking(false);
-        audioElementRef.current = null;
+        // Only update state if this is still the current audio element
+        if (audioElementRef.current === audioElement) {
+          setIsSpeaking(false);
+          audioElementRef.current = null;
+        }
         URL.revokeObjectURL(audioUrl);
       };
 
       audioElement.onerror = (e) => {
         console.error('Frontend: Audio playback error:', e);
-        setIsSpeaking(false);
-        audioElementRef.current = null;
-        setError('Failed to play audio');
+        // Only update state if this is still the current audio element
+        if (audioElementRef.current === audioElement) {
+          setIsSpeaking(false);
+          audioElementRef.current = null;
+          setError('Failed to play audio');
+        }
         URL.revokeObjectURL(audioUrl);
       };
 
@@ -364,21 +385,25 @@ export default function VachanamrutCompanion() {
 
   const stopAudio = () => {
     console.log('Frontend: Stopping audio playback');
-    // Set speaking to false first to enable mic button immediately
-    setIsSpeaking(false);
     
-    // Stop and clean up audio element
+    // Stop and clean up audio element first
     if (audioElementRef.current) {
       try {
         audioElementRef.current.pause();
         audioElementRef.current.currentTime = 0;
+        // Clear all event handlers to prevent them from firing
+        audioElementRef.current.onended = null;
+        audioElementRef.current.onerror = null;
       } catch (e) {
         console.error('Error stopping audio:', e);
       }
       audioElementRef.current = null;
     }
     
-    console.log('Frontend: Audio stopped, microphone button enabled');
+    // Immediately clear speaking state to enable mic button
+    setIsSpeaking(false);
+    
+    console.log('Frontend: Audio stopped, microphone button enabled. States: isSpeaking=false, isProcessing=' + isProcessing);
   };
 
   const base64ToBlob = (base64: string, mimeType: string) => {
@@ -451,7 +476,7 @@ export default function VachanamrutCompanion() {
           <div className="flex justify-center items-center gap-4 mb-8">
             <button
               onClick={isListening ? stopListening : startListening}
-              disabled={isProcessing || isSpeaking}
+              disabled={isProcessing}
               className={`relative w-32 h-32 rounded-full transition-all duration-300 transform hover:scale-110 disabled:opacity-50 disabled:cursor-not-allowed ${
                 isListening
                   ? 'bg-red-500 animate-pulse shadow-lg shadow-red-500/50'
