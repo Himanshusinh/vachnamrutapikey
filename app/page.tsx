@@ -163,11 +163,24 @@ export default function VachanamrutCompanion() {
       };
 
       recognitionRef.current.onerror = (event: SpeechRecognitionErrorEvent) => {
-        console.error('Speech recognition error:', event.error);
-        // Don't show error for "no-speech" or "aborted" errors - these are normal
-        if (event.error !== 'no-speech' && event.error !== 'aborted') {
-          setError(`Voice recognition error: ${event.error}`);
+        // Handle normal/expected errors silently
+        if (event.error === 'no-speech') {
+          // User didn't speak or spoke too quietly - just reset, no error needed
+          console.log('No speech detected - user can try again');
+          setIsListening(false);
+          return;
         }
+        
+        if (event.error === 'aborted') {
+          // User manually stopped - this is normal
+          console.log('Speech recognition aborted - normal');
+          setIsListening(false);
+          return;
+        }
+        
+        // Only log and show real errors
+        console.error('Speech recognition error:', event.error);
+        setError(`Voice recognition error: ${event.error}`);
         setIsListening(false);
       };
 
@@ -210,11 +223,22 @@ export default function VachanamrutCompanion() {
           };
 
           recognitionRef.current.onerror = (event: SpeechRecognitionErrorEvent) => {
-            console.error('Speech recognition error:', event.error);
-            // Don't show error for "no-speech" or "aborted" errors - these are normal
-            if (event.error !== 'no-speech' && event.error !== 'aborted') {
-              setError(`Voice recognition error: ${event.error}`);
+            // Handle normal/expected errors silently
+            if (event.error === 'no-speech') {
+              console.log('No speech detected - user can try again');
+              setIsListening(false);
+              return;
             }
+            
+            if (event.error === 'aborted') {
+              console.log('Speech recognition aborted - normal');
+              setIsListening(false);
+              return;
+            }
+            
+            // Only log and show real errors
+            console.error('Speech recognition error:', event.error);
+            setError(`Voice recognition error: ${event.error}`);
             setIsListening(false);
           };
 
@@ -278,14 +302,25 @@ export default function VachanamrutCompanion() {
                 await processQuery(speechToText);
               };
 
-              recognitionRef.current.onerror = (event: SpeechRecognitionErrorEvent) => {
-                console.error('Speech recognition error:', event.error);
-                // Don't show error for "no-speech" or "aborted" errors - these are normal
-                if (event.error !== 'no-speech' && event.error !== 'aborted') {
-                  setError(`Voice recognition error: ${event.error}`);
-                }
-                setIsListening(false);
-              };
+          recognitionRef.current.onerror = (event: SpeechRecognitionErrorEvent) => {
+            // Handle normal/expected errors silently
+            if (event.error === 'no-speech') {
+              console.log('No speech detected - user can try again');
+              setIsListening(false);
+              return;
+            }
+            
+            if (event.error === 'aborted') {
+              console.log('Speech recognition aborted - normal');
+              setIsListening(false);
+              return;
+            }
+            
+            // Only log and show real errors
+            console.error('Speech recognition error:', event.error);
+            setError(`Voice recognition error: ${event.error}`);
+            setIsListening(false);
+          };
 
               recognitionRef.current.onend = () => {
                 setIsListening(false);
